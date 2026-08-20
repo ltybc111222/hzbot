@@ -1,7 +1,8 @@
-import hashlib, json, os, pathlib, re, urllib.request, urllib.parse
+import json, os, pathlib, re, urllib.request, urllib.parse
+from collections import Counter
 
 # ================= НАСТРОЙКИ =================
-CPU_WANTED    = ["EPYC 7", "EPYC 9"]
+CPU_WANTED    = ["EPYC"]
 MIN_RAM_GB    = 128
 MAX_PRICE_NET = 200
 REQUIRE_ECC   = True
@@ -10,11 +11,10 @@ MAX_NOTIFY    = 10
 # =============================================
 
 CANDIDATES = [
-    "https://www.hetzner.com/_resources/app/data/app/live_data_sb_EUR.json",
-    "https://www.hetzner.com/_resources/app/jsondata/live_data_sb.json",
     "https://www.hetzner.com/_resources/app/data/app/live_data_sb.json",
+    "https://www.hetzner.com/_resources/app/data/app/live_data_sb_EUR.json",
 ]
-UA = "Mozilla/5.0 (compatible; hzbot/3.0)"
+UA = "Mozilla/5.0 (compatible; hzbot/4.0)"
 
 TOKEN = os.environ["TG_TOKEN"]
 CHAT  = os.environ["TG_CHAT"]
@@ -38,22 +38,17 @@ def send(text):
 
 def discover():
     html = http("https://www.hetzner.com/sb/").decode("utf-8", "replace")
-    found = re.findall(r'["\'](/[\w/.\-]*live_data_sb[\w.\-]*\.json)["\']', html)
-    return ["https://www.hetzner.com" + p for p in dict.fromkeys(found)]
+    hits = re.findall(r'["\'](/[\w/.\-]*live_data_sb[\w.\-]*\.json)["\']', html)
+    return ["https://www.hetzner.com" + p for p in dict.fromkeys(hits)]
 
 
 def unwrap(doc):
     if isinstance(doc, list):
         return doc
-    for k in ("server", "servers", "data", "products", "offers"):
-        v = doc.get(k)
-        if isinstance(v, list) and v:
-            return v
     for k, v in doc.items():
         if isinstance(v, list) and v and isinstance(v[0], dict):
-            print(f"unwrap: использую ключ '{k}'")
             return v
-    raise ValueError(f"ключи верхнего уровня = {list(doc)[:20]}")
+    raise ValueError(f"ключи = {list(doc)[:20]}")
 
 
 def fetch():
@@ -67,110 +62,120 @@ def fetch():
     raise SystemExit("Ни один адрес не сработал")
 
 
-def pick(s, *names, default=None):
-    for n in names:
-        v = s.get(n)
-        if v not in (None, "", [], {}):
-            return v
-    return default
+def dig(s, path, default=None):
+    cur = s
+    for part in path.split("."):
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(part)
+        if cur is None:
+            return default
+    return cur
 
 
-def num(x, default=0.0):
-    try:
-        return float(re.sub(r"[^\d.,\-]", "", str(x)).replace(",", "."))
-    except (TypeError, ValueError):
-        return default
+def sid(s):
+    return str(dig(s, "Id", ""))
 
 
-def flat(v):
-    if isinstance(v, list):
-        return " ".join(str(x) for x in v)
-    return str(v) if v is not None else "?"
+def cpu(s):
+    return str(dig(s, "Hardware.CPU.Name", "") or "")
 
 
-def f_cpu(s):
-    return str(pick(s, "cpu", "cpu_name", "cpu_description", "processor", default=""))
+def cores(s):
+    return dig(s, "Hardware.CPU.CoreCount", 0) or 0
 
 
-def f_ram(s):
-    return num(pick(s, "ram", "ram_size", "memory", "ram_gb", default=0))
+def ram(s):
+    v = dig(s, "Hardware.RAM.Size")
+    if v:
+        return float(v)
+    real = dig(s, "Hardware.RAM.RealSize")
+    return float(real) / 1024 if real else 0.0
 
 
-def f_price(s):
-    return num(pick(s, "price", "price_net", "cost", "amount", default=0))
+def ecc(s):
+    return bool(dig(s, "Hardware.RAM.ecc", False))
 
 
-def f_ecc(s):
-    v = pick(s, "is_ecc", "ecc")
-    if isinstance(v, bool):
-        return v
-    sp = flat(pick(s, "specials", "features", default="")).lower()
-    return "ecc" in sp
+def price(s):
+    return float(dig(s, "Prices.monthly.EUR", 0) or 0)
 
 
-def f_id(s):
-    v = pick(s, "key", "id", "server_id", "sb_id", "auction_id")
-    if v is not None:
-        return str(v)
-    seed = f"{f_cpu(s)}|{f_ram(s)}|{flat(pick(s, 'hdd_hr', 'hdd', default=''))}" \
-           f"|{flat(pick(s, 'datacenter', 'dc', default=''))}"
-    return "h" + hashlib.md5(seed.encode()).hexdigest()[:12]
+def hourly(s):
+    return float(dig(s, "Prices.hourly.EUR", 0) or 0)
+
+
+def setup(s):
+    return float(dig(s, "Prices.setup.EUR", 0) or 0)
+
+
+def disks(s):
+    d = dig(s, "Hardware.Storage.Disks", [])
+    return ", ".join(str(x) for x in d) if d else "?"
+
+
+def specials(s):
+    v = dig(s, "Details.Specials", [])
+    return ", ".join(str(x) for x in v) if v else ""
 
 
 def matches(s):
-    cpu = f_cpu(s)
-    if not any(m.lower() in cpu.lower() for m in CPU_WANTED):
+    if not any(m.lower() in cpu(s).lower() for m in CPU_WANTED):
         return False
-    if f_ram(s) < MIN_RAM_GB:
+    if ram(s) < MIN_RAM_GB:
         return False
-    if f_price(s) > MAX_PRICE_NET:
+    if price(s) > MAX_PRICE_NET:
         return False
-    if REQUIRE_ECC and not f_ecc(s):
+    if REQUIRE_ECC and not ecc(s):
         return False
     return True
 
 
 def card(s):
-    p = f_price(s)
+    p = price(s)
     return (
-        f"<b>{f_cpu(s) or '?'}</b>\n"
-        f"RAM {f_ram(s):.0f} GB · {flat(pick(s, 'datacenter', 'dc', default='?'))}\n"
-        f"Диски: {flat(pick(s, 'hdd_hr', 'hdd', 'disks', default='?'))}\n"
+        f"<b>{cpu(s) or '?'}</b>  ({cores(s)} cores)\n"
+        f"RAM {ram(s):.0f} GB{' ECC' if ecc(s) else ''}\n"
+        f"Диски: {disks(s)}\n"
         f"EUR {p:.2f} нетто · EUR {p * (1 + VAT):.2f} с НДС\n"
-        f"Setup: {num(pick(s, 'setup_price', default=0)):.2f}\n"
-        f"Снижение через: {flat(pick(s, 'next_reduce_hr', default='?'))}\n"
-        f"https://www.hetzner.com/sb/#search={f_id(s)}"
+        f"Час: EUR {hourly(s):.4f} · Setup: EUR {setup(s):.2f}\n"
+        f"{specials(s)}\n"
+        f"https://www.hetzner.com/sb/#search={sid(s)}"
     )
 
 
 def diagnose(servers):
-    first = servers[0]
-    print("KEYS:", list(first.keys()))
-    print("SAMPLE:", json.dumps(first, ensure_ascii=False)[:900])
-    epyc = [s for s in servers if "epyc" in f_cpu(s).lower()]
-    print(f"EPYC={len(epyc)} ECC={sum(1 for s in servers if f_ecc(s))}")
-    for s in sorted(epyc, key=lambda x: -f_ram(x))[:10]:
-        print(f"  {f_cpu(s)} | ram={f_ram(s):.0f} | price={f_price(s):.2f} "
-              f"| ecc={f_ecc(s)} | id={f_id(s)}")
+    top = Counter(cpu(s) for s in servers).most_common(12)
+    print("TOP CPU:")
+    for name, n in top:
+        print(f"  {n:3d}  {name}")
+
+    big = [s for s in servers if ram(s) >= 64 and ecc(s)]
+    print(f"ECC+64GB: {len(big)}")
+    for s in sorted(big, key=lambda x: -ram(x))[:10]:
+        print(f"  {cpu(s)} | {cores(s)}c | ram={ram(s):.0f} | "
+              f"EUR {price(s):.2f} | id={sid(s)}")
 
 
 def main():
     servers = fetch()
     if not servers:
-        raise SystemExit("Пустой список лотов")
+        raise SystemExit("Пустой список")
 
     diagnose(servers)
     if os.environ.get("DUMP"):
         return
 
     prev = set(json.loads(STATE.read_text())) if STATE.exists() else set()
-    quiet = len(prev) == 0
+    quiet = len(prev) <= 1
 
     seen, hits = set(), []
     for s in servers:
-        sid = f_id(s)
-        seen.add(sid)
-        if sid not in prev and matches(s):
+        i = sid(s)
+        if not i:
+            continue
+        seen.add(i)
+        if i not in prev and matches(s):
             hits.append(s)
 
     if quiet:
@@ -179,7 +184,7 @@ def main():
     for s in hits[:MAX_NOTIFY]:
         send(card(s))
     if len(hits) > MAX_NOTIFY:
-        send(f"Ещё {len(hits) - MAX_NOTIFY} подходящих лотов не показаны")
+        send(f"Ещё {len(hits) - MAX_NOTIFY} лотов не показаны")
 
     STATE.write_text(json.dumps(sorted(seen)))
     print(f"lots={len(servers)} hits={len(hits)} seen={len(seen)} quiet={quiet}")
