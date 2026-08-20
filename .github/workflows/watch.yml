@@ -1,0 +1,32 @@
+name: hzbot
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hzbot
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: python watch.py
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+          DUMP: ${{ inputs.dump }}
+
+      - name: save state
+        run: |
+          git config user.name  "hzbot"
+          git config user.email "hzbot@users.noreply.github.com"
+          git add seen.json
+          git diff --staged --quiet || git commit -m "state"
+          git push
